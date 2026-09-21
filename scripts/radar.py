@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_URL = os.environ.get("BIDWIN_SERVER_URL", "https://gate.gov-bid.com") + "/outer-gateway/bid"
 TIMEOUT = 45
 
@@ -412,7 +412,8 @@ def match_pos(title, keyword):
     return "仅正文"
 
 
-def cmd_search(args):
+def run_search(args):
+    """执行一次检索，返回 (meta, rows)；探量时 rows 为 None。"""
     key = None if args.replay else get_key()   # 回放模式不需要 key
     start, end, how = resolve_window(args)
 
@@ -523,8 +524,7 @@ def cmd_search(args):
     if args.probe:
         meta["hint"] = ("total ≤ 100 可直接正式搜；> 100 建议先帮用户缩窄"
                         "（限地区 / 缩时间 / 加排除词），不要直接甩一堆结果")
-        emit(meta, args)
-        return
+        return meta, None
 
     rows = [shape(r) for r in (d.get("data") or [])]
     raw_n = len(rows)
@@ -560,6 +560,11 @@ def cmd_search(args):
         "HTML 标签已删除", "已按 标题+甲方+金额 去重",
         "截止日期一律「未注明」，禁用发布时间冒充",
     ]
+    return meta, rows
+
+
+def cmd_search(args):
+    meta, rows = run_search(args)
     emit(meta, args, rows)
 
 
@@ -737,6 +742,141 @@ def cmd_check(args):
     }, ensure_ascii=False, indent=2))
 
 
+# ── 每日推送：订阅条件（只存在本机 ~/.bidwin/watch.json，不上传）──────────────
+WATCH_FILE = "~/.bidwin/watch.json"
+WATCH_MAX = 3            # 最多保存几组条件
+WATCH_DAYS = 3           # 每次推送查近几天（只查当天会漏前两天发布、仍可投的标）
+SEEN_KEEP_DAYS = 60      # 推送记录保留多久
+
+
+def watch_path():
+    return os.path.expanduser(WATCH_FILE)
+
+
+def load_watch():
+    try:
+        with open(watch_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("watches", [])
+    d.setdefault("seen", {})
+    return d
+
+
+def save_watch(d):
+    p = watch_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def _watch_view(w):
+    parts = ["主题：%s" % w["keyword"]]
+    if w.get("include"):
+        parts.append("必含：%s" % w["include"])
+    if w.get("exclude"):
+        parts.append("排除：%s" % w["exclude"])
+    parts.append("地区：%s" % ("、".join(w["area"]) if w.get("area") else "全国"))
+    if w.get("money_min") or w.get("money_max"):
+        parts.append("金额：%s ~ %s 元" % (w.get("money_min") or "不限", w.get("money_max") or "不限"))
+    if w.get("purchase") and w["purchase"] != "全部":
+        parts.append("采购类型：%s" % w["purchase"])
+    return {"name": w["name"], "conditions": "；".join(parts), "created": w.get("created")}
+
+
+def cmd_watch_set(args):
+    if not args.keyword:
+        die("--keyword 必填")
+    if PURCHASE_TYPES.get(args.purchase or "全部") is None:
+        die("--purchase 只能是：%s" % " / ".join(PURCHASE_TYPES))
+    for name in args.area or []:
+        if resolve_area(name)[0] is None:
+            die("无法识别的地区：%s（先用 areas 命令查正确地名）" % name)
+    d = load_watch()
+    w = {
+        "name": args.name.strip(), "keyword": args.keyword, "include": args.include or "",
+        "exclude": args.exclude or "", "area": args.area or [], "money_min": args.money_min,
+        "money_max": args.money_max, "purchase": args.purchase or "全部",
+        "created": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    others = [x for x in d["watches"] if x["name"] != w["name"]]
+    if len(others) >= WATCH_MAX:
+        die("最多保存 %d 组推送条件，已满：%s。请先删除一组（watch delete --name <名称>）"
+            % (WATCH_MAX, "、".join(x["name"] for x in others)))
+    replaced = len(others) != len(d["watches"])
+    d["watches"] = others + [w]
+    save_watch(d)
+    print(json.dumps({"ok": True, "action": "已更新" if replaced else "已保存",
+                      "watch": _watch_view(w), "total_watches": len(d["watches"]),
+                      "saved_to": watch_path(), "note": "只保存在本机，不上传"},
+                     ensure_ascii=False, indent=2))
+
+
+def cmd_watch_list(args):
+    d = load_watch()
+    print(json.dumps({"ok": True, "count": len(d["watches"]),
+                      "watches": [_watch_view(w) for w in d["watches"]],
+                      "pushed_records": len(d["seen"])}, ensure_ascii=False, indent=2))
+
+
+def cmd_watch_delete(args):
+    d = load_watch()
+    left = [x for x in d["watches"] if x["name"] != args.name]
+    if len(left) == len(d["watches"]):
+        die("没有名为「%s」的推送条件" % args.name)
+    d["watches"] = left
+    save_watch(d)
+    print(json.dumps({"ok": True, "deleted": args.name, "remaining": len(left)},
+                     ensure_ascii=False, indent=2))
+
+
+def cmd_watch_run(args):
+    """按已保存的条件查近 N 天，跳过以前推送过的标，只返回新标。"""
+    d = load_watch()
+    if not d["watches"]:
+        die("还没有保存任何推送条件。请先让用户设置每日推送", code=5)
+    today = now_cn().strftime("%Y-%m-%d")
+    cutoff = (now_cn() - timedelta(days=SEEN_KEEP_DAYS)).strftime("%Y-%m-%d")
+    seen = {k: v for k, v in d["seen"].items() if v >= cutoff}
+    out, shown, date_range = [], set(), None
+    for w in d["watches"]:
+        ns = argparse.Namespace(
+            keyword=w["keyword"], include=w.get("include") or None, exclude=w.get("exclude") or None,
+            days=args.days, last=None, start=None, end=None, area=w.get("area") or None,
+            area_code=None, classes=DEFAULT_CLASS_IDS, purchase=w.get("purchase") or "全部",
+            money_min=w.get("money_min"), money_max=w.get("money_max"), page=1, size=PAGE_MAX,
+            probe=False, allow_result=False, limit=None, out=None, dump_raw=None,
+            replay=args.replay,
+        )
+        meta, rows = run_search(ns)
+        date_range = meta["date_range"]
+        new = []
+        for r in rows:
+            k = str(r["id"])
+            if k in seen or k in shown:
+                continue
+            shown.add(k)
+            new.append(r)
+        out.append({
+            "name": w["name"], "conditions": _watch_view(w)["conditions"], "total": meta["total"],
+            "has_more_than_one_page": bool(meta.get("has_next")),
+            "already_pushed_skipped": len(rows) - len(new), "new_count": len(new), "results": new,
+        })
+    if not args.dry_run:
+        for k in shown:
+            seen[k] = today
+        d["seen"] = seen
+        save_watch(d)
+    print(json.dumps({"ok": True, "engine": "bidwin-radar v%s" % VERSION, "date_range": date_range,
+                      "date_basis": "近 %d 天（含今天），已推送过的标不再重复" % args.days,
+                      "dry_run": bool(args.dry_run),
+                      "new_total": sum(x["new_count"] for x in out), "watches": out},
+                     ensure_ascii=False, indent=2))
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
 def build_parser():
     p = argparse.ArgumentParser(
@@ -787,6 +927,29 @@ def build_parser():
     k = sub.add_parser("setkey", help="写入 key 到 ~/.bidwin/key（不调接口）")
     k.add_argument("--key", required=True)
     k.set_defaults(func=cmd_setkey)
+
+    w = sub.add_parser("watch", help="每日推送的订阅条件（只存本机）")
+    wsub = w.add_subparsers(dest="watch_cmd", required=True)
+    ws = wsub.add_parser("set", help="保存 / 更新一组推送条件（不调接口）")
+    ws.add_argument("--name", required=True, help="这组条件的名字，如「北京数字人」")
+    ws.add_argument("--keyword", required=True)
+    ws.add_argument("--include")
+    ws.add_argument("--exclude")
+    ws.add_argument("--area", action="append")
+    ws.add_argument("--money-min", type=int)
+    ws.add_argument("--money-max", type=int)
+    ws.add_argument("--purchase", default="全部")
+    ws.set_defaults(func=cmd_watch_set)
+    wl = wsub.add_parser("list", help="查看已保存的推送条件（不调接口）")
+    wl.set_defaults(func=cmd_watch_list)
+    wd = wsub.add_parser("delete", help="删除一组推送条件（不调接口）")
+    wd.add_argument("--name", required=True)
+    wd.set_defaults(func=cmd_watch_delete)
+    wr = wsub.add_parser("run", help="按已保存条件推送新标（定时任务调用）")
+    wr.add_argument("--days", type=int, default=WATCH_DAYS)
+    wr.add_argument("--dry-run", action="store_true", help="试跑：不记录为已推送")
+    wr.add_argument("--replay", help=argparse.SUPPRESS)
+    wr.set_defaults(func=cmd_watch_run)
 
     c = sub.add_parser("check", help="环境自检（不调接口）")
     c.set_defaults(func=cmd_check)
