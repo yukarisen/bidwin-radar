@@ -21,7 +21,7 @@
     python3 radar.py areas 杭州                               # 查地名（不调接口）
 （Windows 上把 python3 换成 python 或 py）
 
-每次接口调用都有成本，探量（--probe）也算一次，不要为试参数反复调用。
+服务器每分钟最多接受 60 次请求；探量（--probe）也是一次请求，不要为试参数反复调用。
 """
 
 import argparse
@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 BASE_URL = os.environ.get("BIDWIN_SERVER_URL", "https://gate.gov-bid.com") + "/outer-gateway/bid"
 TIMEOUT = 45
 
@@ -318,7 +318,7 @@ def post(path, payload, key):
     except ValueError:
         raise ApiError("返回非 JSON：%s" % raw[:300])
     if data.get("code") == 200:
-        _CALLS["n"] += 1  # code=200 即计费，与返回内容无关
+        _CALLS["n"] += 1  # code=200 即计一次调用，与返回内容无关
     else:
         raise ApiError("接口返回 code=%s subCode=%s msg=%s"
                        % (data.get("code"), data.get("subCode"), data.get("msg") or data.get("subMsg")))
@@ -484,7 +484,7 @@ def run_search(args):
         payload["projectMoneyMax"] = str(args.money_max)
 
     if args.replay:
-        # 离线回放：拿之前 --dump-raw 存下的原始响应重跑筛选逻辑，不调接口、不扣费
+        # 离线回放：拿之前 --dump-raw 存下的原始响应重跑筛选逻辑，不调接口
         try:
             with open(args.replay, encoding="utf-8") as f:
                 resp = json.load(f)
@@ -917,7 +917,7 @@ def build_parser():
     d.add_argument("--publish-time", required=True, help="列表里的 publish_time 原值")
     d.add_argument("--with-content", action="store_true", help="附带正文")
     d.add_argument("--max-chars", type=int, default=3000, help="正文最多输出多少字，默认 3000")
-    d.add_argument("--brief", action="store_true", help="只取结构化字段，省 1 次（拿不到地区/行业/阶段）")
+    d.add_argument("--brief", action="store_true", help="只取结构化字段，少一次请求（拿不到地区/行业/阶段）")
     d.set_defaults(func=cmd_detail)
 
     a = sub.add_parser("areas", help="查地区码（不调接口）")
