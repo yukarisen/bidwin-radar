@@ -19,8 +19,8 @@
 它会自动下载、安装并检查运行环境。中途如果电脑弹窗询问是否允许安装，点「是 / 安装 / 允许」即可。
 
 > 如果它提示无法下载：
-> 1. 打开上面的链接，点绿色的「Code」按钮 →「Download ZIP」下载压缩包
-> 2. 在 AI 助手的技能管理页面选择「上传 / 导入技能」，把压缩包放进去
+> 1. 用浏览器打开上面的链接，在 GitHub 页面上点「Code」按钮 →「Download ZIP」，把压缩包下载到电脑上
+> 2. 把这个压缩包发给 AI 助手，并说：「请帮我安装这个压缩包里的技能」
 
 ### 第 2 步：发送你的 key
 
@@ -72,7 +72,7 @@ key 只保存在你自己电脑的 `~/.bidwin/key` 文件里，不在技能文�
 
 > 以下内容写给安装本技能的 Agent。用户发来本仓库链接要求安装时，按此执行。
 
-1. 下载仓库压缩包：`https://github.com/yukarisen/bidwin-radar/archive/refs/heads/main.zip`
+1. 下载仓库压缩包：`https://github.com/yukarisen/bidwin-radar/archive/refs/heads/main.zip`（用户已经直接发来压缩包的，跳过这一步）
 2. 解压后得到 `bidwin-radar-main` 文件夹，**重命名为 `bidwin-radar`**，放进你（当前 Agent）加载技能的目录。不确定目录在哪，就按你所在平台的技能安装方式处理。
 3. 确认 `bidwin-radar/SKILL.md` 与 `bidwin-radar/scripts/radar.py` 都存在。
 4. 按 `references/setup.md` 完成首次环境检查（确认本机有 Python 3.8+，没有就安装）。
