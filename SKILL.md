@@ -2,7 +2,7 @@
 name: bidwin-radar
 slug: bidwin-radar
 displayName: 必赢 · 标讯雷达
-version: 1.1.1
+version: 1.1.2
 summary: 用一句话查全国招投标公告：按主题、地区、时间、金额、采购类型筛选，回编号看报名截止、联系人等详情。
 license: Proprietary
 description: |

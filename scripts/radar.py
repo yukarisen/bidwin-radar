@@ -35,8 +35,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.1"
-BASE_URL = os.environ.get("BIDWIN_SERVER_URL", "https://gate.gov-bid.com") + "/outer-gateway/bid"
+VERSION = "1.1.2"
+BASE_URL = "https://gate.gov-bid.com/outer-gateway/bid"   # 写死，不接受环境变量覆盖
 TIMEOUT = 45
 
 # 🔴 北京时间硬编码，不依赖服务器系统时区。
