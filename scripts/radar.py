@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 BASE_URL = "https://gate.gov-bid.com/outer-gateway/bid"   # 写死，不接受环境变量覆盖
 TIMEOUT = 45
 
