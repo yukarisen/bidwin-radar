@@ -107,8 +107,8 @@ open ~/Downloads/python-3.12.7-macos11.pkg
 
 看到 `"python_ok": true` 即 Python 就绪。
 
-- `key_configured` 为 false → 回到 SKILL.md「写入 key」，请用户把 key 发给你
-- `key_configured` 为 true → 已完成，告诉用户可以直接开始查标
+- `key_configured` 为 false → 回到 SKILL.md「写入 key」，请用户把 key 发给你；写完 key 接着做「资质问卷」（可跳过）
+- `key_configured` 为 true → 已完成，告诉用户可以直接开始查标（`profile_exists` 为 false 时，顺带做一次「资质问卷」）
 
 安装完成后回复用户（示例）：
 

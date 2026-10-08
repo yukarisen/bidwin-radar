@@ -19,6 +19,9 @@
     python3 radar.py search --keyword "数字人" --last 1m --limit 20
     python3 radar.py detail --id 304974237 --publish-time "2026-08-01 09:00:00"
     python3 radar.py areas 杭州                               # 查地名（不调接口）
+    python3 radar.py profile set --established 2019-06 --capital-wan 500 --headcount 30 --reg-area 杭州
+    python3 radar.py profile cert --name "广播电视节目制作经营许可证" --has no
+    python3 radar.py screen --ids "304974237|2026-08-01 09:00:00;;304974238|2026-08-01 10:00:00"
 （Windows 上把 python3 换成 python 或 py）
 
 服务器每分钟最多接受 60 次请求；探量（--probe）也是一次请求，不要为试参数反复调用。
@@ -35,7 +38,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 BASE_URL = "https://gate.gov-bid.com/outer-gateway/bid"   # 写死，不接受环境变量覆盖
 TIMEOUT = 45
 
@@ -555,6 +558,8 @@ def run_search(args):
     if dropped_terms:
         meta["warning"] = ("排除词合计超过 %d 字符上限，以下词未生效：%s"
                            % (EXCLUDE_MAXLEN, "、".join(dropped_terms)))
+    if profile_empty(load_profile()):
+        meta["profile_hint"] = PROFILE_HINT
     meta["rules_applied"] = [
         "日期由北京时间计算", "精准匹配",
         "HTML 标签已删除", "已按 标题+甲方+金额 去重",
@@ -669,6 +674,17 @@ def cmd_detail(args):
     }
     if args.with_content:
         out["content"] = strip_html(ct.get("content") or "")[: args.max_chars]
+    if ct:
+        # 正文已经拉了，资质比对不多花请求；用全文比对，不受 --max-chars 截断影响
+        prof = load_profile()
+        m = screen_one(strip_html(ct.get("content") or ""), prof, ct.get("proviceCode"), ct.get("cityCode"))
+        if profile_empty(prof):
+            # 用户跳过了问卷：不展示对照、不追问。提示由查标结果统一放在回复末尾，不跟着单条标走
+            out["match"] = {"profile_empty": True}
+        else:
+            m["profile_empty"] = False
+            m["rule"] = MATCH_RULE
+            out["match"] = m
     out["reminder"] = "字段为空一律输出「未注明」，不得编造，尤其不得用发布时间当报名截止日期"
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
@@ -737,6 +753,7 @@ def cmd_check(args):
         "key_configured": bool(k),
         "key": mask(k) if k else None,
         "key_source": src,
+        "profile_exists": os.path.exists(profile_path()),
         "beijing_now": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
         "note": "本命令不调接口",
     }, ensure_ascii=False, indent=2))
@@ -870,11 +887,607 @@ def cmd_watch_run(args):
             seen[k] = today
         d["seen"] = seen
         save_watch(d)
+    prof = load_profile()
+    empty = profile_empty(prof)
+    hint = None
+    if empty and not prof.get("push_hint_shown"):
+        hint = "填写公司基本情况后，推送可以只给你门槛够得上的标。随时发送「填写我的资质」就行。"
+        if not args.dry_run:
+            prof["push_hint_shown"] = True
+            save_profile(prof)
     print(json.dumps({"ok": True, "engine": "bidwin-radar v%s" % VERSION, "date_range": date_range,
                       "date_basis": "近 %d 天（含今天），已推送过的标不再重复" % args.days,
                       "dry_run": bool(args.dry_run),
-                      "new_total": sum(x["new_count"] for x in out), "watches": out},
+                      "new_total": sum(x["new_count"] for x in out),
+                      "screen": {
+                          # 列表没有截止日期：不管有没有资质档案，都要走 screen 去掉已过报名截止的标
+                          "required": True,
+                          "match_enabled": not empty,
+                          "push_mode": prof.get("push_mode", "fold"),
+                          "next_step": ("按相关性筛完后，把保留的标用 screen --ids 查报名截止"
+                                        + ("并做资质精筛" if not empty else "（档案为空，只查截止，每条 1 次请求）")
+                                        + "；expired 的不推送"),
+                          "profile_hint": hint,
+                      },
+                      "watches": out},
                      ensure_ascii=False, indent=2))
+
+
+# ── 资质档案（只存在本机 ~/.bidwin/profile.json，不上传）────────────────────
+# 安装时只问 4 项基本门槛（成立时间 / 注册资本 / 参保人数 / 注册地），可跳过。
+# 资质证书、业绩不设问卷：遇到哪条标要求了再问一句「有 / 没有」，答案记下来，下次不再问。
+# 「没有」也要记——记住没有，才能在下次准确判「不符合」；只记「有」的话名字对不上就只能判「需确认」。
+PROFILE_FILE = "~/.bidwin/profile.json"
+PUSH_MODES = {"fold": "不符合的折叠成一行（默认）", "all": "全部展示，不符合的标注出来"}
+SCREEN_MAX = 30          # screen 一次最多筛几条（每条 2 次请求，限速 60 次/分钟）
+
+
+def profile_path():
+    return os.path.expanduser(PROFILE_FILE)
+
+
+def load_profile():
+    try:
+        with open(profile_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("basics", {})
+    d.setdefault("certs", {})
+    d.setdefault("cases", {})
+    d.setdefault("ask", True)
+    d.setdefault("push_mode", "fold")
+    return d
+
+
+def save_profile(d):
+    p = profile_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    d["updated"] = now_cn().strftime("%Y-%m-%d %H:%M:%S")
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def profile_empty(d):
+    return not (d.get("basics") or d.get("certs") or d.get("cases"))
+
+
+def _yn(v):
+    return "有" if v else "没有"
+
+
+def _profile_view(d):
+    b = d.get("basics") or {}
+    return {
+        "成立时间": b.get("established") or "未填",
+        "注册资本": ("%g 万元" % b["capital_wan"]) if b.get("capital_wan") is not None else "未填",
+        "参保人数": ("%d 人" % b["headcount"]) if b.get("headcount") is not None else "未填",
+        "注册地": " ".join(x for x in [b.get("reg_prov"), b.get("reg_city")] if x) or "未填",
+        "资质证书": {k: _yn(v) for k, v in (d.get("certs") or {}).items()} or "暂无记录（遇到要求时再问）",
+        "业绩案例": {k: _yn(v) for k, v in (d.get("cases") or {}).items()} or "暂无记录（遇到要求时再问）",
+        "追问": "开" if d.get("ask", True) else "关（只标注，不再追问）",
+        "推送精筛": PUSH_MODES.get(d.get("push_mode", "fold")),
+    }
+
+
+_EST_RE = re.compile(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$")
+
+
+def _est_bounds(s):
+    """成立时间 → (最早可能日期, 最晚可能日期)。用户常只记得年份或年月，按区间判定，不硬猜。"""
+    m = _EST_RE.match((s or "").strip())
+    if not m:
+        return None, None
+    y, mo, dd = int(m.group(1)), m.group(2), m.group(3)
+    try:
+        if dd:
+            d = datetime(y, int(mo), int(dd)).date()
+            return d, d
+        if mo:
+            first = datetime(y, int(mo), 1).date()
+            nxt = datetime(y + (int(mo) == 12), int(mo) % 12 + 1, 1).date()
+            return first, nxt - timedelta(days=1)
+        return datetime(y, 1, 1).date(), datetime(y, 12, 31).date()
+    except ValueError:
+        return None, None
+
+
+def cmd_profile_set(args):
+    d = load_profile()
+    b = d["basics"]
+    changed = []
+    if args.established:
+        lo, _ = _est_bounds(args.established)
+        if lo is None:
+            die("--established 格式应为 YYYY / YYYY-MM / YYYY-MM-DD，收到：%s" % args.established)
+        if lo > now_cn().date():
+            die("成立时间晚于今天：%s" % args.established)
+        b["established"] = args.established.strip()
+        changed.append("成立时间")
+    if args.capital_wan is not None:
+        if args.capital_wan <= 0:
+            die("--capital-wan 必须大于 0（单位：万元）")
+        b["capital_wan"] = args.capital_wan
+        changed.append("注册资本")
+    if args.headcount is not None:
+        if args.headcount < 0:
+            die("--headcount 不能为负数")
+        b["headcount"] = args.headcount
+        changed.append("参保人数")
+    if args.reg_area:
+        level, code = resolve_area(args.reg_area)
+        if level is None:
+            die("无法识别的注册地：%s（填到省或地级市即可，如「上海」「杭州」；先用 areas 命令查）"
+                % args.reg_area)
+        if level == "province":
+            b["reg_prov"], b["reg_city"] = _PROV_BY_CODE[code], None
+        else:
+            b["reg_prov"], b["reg_city"] = _PROV_BY_CODE.get(code[:2] + "0000"), _CITY_BY_CODE[code]
+        changed.append("注册地")
+    if args.ask:
+        d["ask"] = args.ask == "on"
+        changed.append("追问")
+    if args.push_mode:
+        d["push_mode"] = args.push_mode
+        changed.append("推送精筛")
+    if not changed:
+        die("没有要修改的项")
+    save_profile(d)
+    print(json.dumps({"ok": True, "updated": changed, "profile": _profile_view(d),
+                      "saved_to": profile_path(), "note": "只保存在本机，不上传"},
+                     ensure_ascii=False, indent=2))
+
+
+def _cmd_profile_item(args, bucket, label):
+    d = load_profile()
+    name = (args.name or "").strip()
+    if not name:
+        die("--name 不能为空")
+    if args.remove:
+        if name not in d[bucket]:
+            die("档案里没有「%s」" % name)
+        d[bucket].pop(name)
+        action = "已删除"
+    else:
+        if args.has not in ("yes", "no"):
+            die("--has 只能是 yes 或 no")
+        d[bucket][name] = args.has == "yes"
+        action = "已记录：%s「%s」" % (_yn(d[bucket][name]), name)
+    save_profile(d)
+    print(json.dumps({"ok": True, "kind": label, "action": action,
+                      label: {k: _yn(v) for k, v in d[bucket].items()}},
+                     ensure_ascii=False, indent=2))
+
+
+def cmd_profile_cert(args):
+    _cmd_profile_item(args, "certs", "资质证书")
+
+
+def cmd_profile_case(args):
+    _cmd_profile_item(args, "cases", "业绩案例")
+
+
+def cmd_profile_show(args):
+    d = load_profile()
+    print(json.dumps({"ok": True, "empty": profile_empty(d), "profile": _profile_view(d),
+                      "saved_to": profile_path()}, ensure_ascii=False, indent=2))
+
+
+# ── 硬门槛比对（移植自 BidWin screen）──────────────────────────────────────
+# 🔴 能算的全在代码里算完，模型只念 match_line 成品句，不得自行改写 checks。
+#    BidWin 实测：模型把「未提及」译成了「未核对」，意思完全相反。
+# 每项五态：满足 / 不满足 / 未提及（查过了公告没写）/ 待补充（公告有要求、档案没这项）/ 需确认。
+# 只有「不满足」会导致折叠，而且只由确定性的项触发；证书名对不上、业绩这类语义判断永远不折叠。
+_NUM = r"([0-9][0-9,，.]*)"
+_UNIT = r"(亿元|亿|万元|万|元)"
+# 「要求」的引导词——没有这些的多半是在描述别人，不是对投标人的硬性要求
+_REQ = r"(?:须|必须|应|应当|需|要求|满|不得低于|不得少于|不低于|不少于|不小于|达到|具备|拥有|持有|≥|>=)"
+_MUNICIPALITIES = {"北京市", "上海市", "天津市", "重庆市"}
+
+
+def _to_wan(num, unit):
+    """金额统一换算成「万元」"""
+    try:
+        v = float(str(num).replace(",", "").replace("，", ""))
+    except ValueError:
+        return None
+    if unit in ("亿元", "亿"):
+        return v * 10000
+    if unit in ("万元", "万"):
+        return v
+    return v / 10000          # 元
+
+
+def _ev(text, m, span=40):
+    """截取命中处上下文当证据"""
+    a = max(0, m.start() - span)
+    b = min(len(text), m.end() + span)
+    return re.sub(r"\s+", " ", text[a:b]).strip()
+
+
+def _req_capital(text):
+    """注册资本要求 → (要求万元, evidence)"""
+    for pat in (r"(?:注册|实缴)资[本金][^。；;\n]{0,30}?" + _REQ + r"[^。；;\n]{0,15}?" + _NUM + r"\s*" + _UNIT,
+                _REQ + r"[^。；;\n]{0,10}?(?:注册|实缴)资[本金][^。；;\n]{0,15}?" + _NUM + r"\s*" + _UNIT):
+        m = re.search(pat, text)
+        if m:
+            wan = _to_wan(m.group(1), m.group(2))
+            if wan:
+                return wan, _ev(text, m)
+    return None, None
+
+
+def _req_years(text):
+    """成立年限要求 → (年, evidence)"""
+    for pat in (r"(?:成立|注册|经营)[^。；;\n]{0,20}?" + _REQ + r"[^。；;\n]{0,10}?([0-9]+)\s*年",
+                _REQ + r"[^。；;\n]{0,12}?(?:成立|注册|经营)[^。；;\n]{0,10}?([0-9]+)\s*年",
+                r"([0-9]+)\s*年以上[^。；;\n]{0,10}?(?:经营|成立|注册)"):
+        m = re.search(pat, text)
+        if m:
+            try:
+                return int(m.group(1)), _ev(text, m)
+            except ValueError:
+                pass
+    return None, None
+
+
+def _req_headcount(text):
+    """参保人数要求 → (人数, evidence)"""
+    m = re.search(r"(?:参保|社保|缴纳社会保险)[^。；;\n]{0,25}?" + _REQ + r"[^。；;\n]{0,10}?([0-9]+)\s*(?:人|名)", text)
+    if m:
+        try:
+            return int(m.group(1)), _ev(text, m)
+        except ValueError:
+            pass
+    return None, None
+
+
+def _req_prequalified(text):
+    """是否要求「事先入库/入围」才能投 → evidence
+    实测坑：①「应」会匹配到「供应商」里的应；②「被列入不良行为供应商库」是排除失信企业，不是入库门槛"""
+    for m in re.finditer(r"(?:须|必须|(?<!供)应|仅限|限于|应当)[^。；;\n]{0,25}?"
+                         r"(?:入[围库]|供应商库|名录库|合格供应商名单|资格库)[^。；;\n]{0,15}", text):
+        # ③「使用平台前完成供应商注册，加入平台供应商库」是谁都能办的平台注册，不是门槛
+        if not re.search(r"列入|不良|黑名单|失信|禁止|违法|平台|注册", m.group(0)):
+            return _ev(text, m)
+    return None
+
+
+_LOCAL_ALT = re.compile(r"或|分公司|分支机构|服务网点|网点|办事处|驻点|服务机构|常驻")
+
+
+def _req_local(text):
+    """是否要求本地注册 → (层级 province/city/district, evidence, 是否允许分支机构等替代)
+    实测：「本地注册企业或设有固定服务网点」「非本市注册的须在本市注册分公司」——外地企业也能投，不能判不满足"""
+    for pat in (
+        # 「注册地…在本市」——本市后面不一定还有词
+        r"(?:注册地|注册所在地|工商注册地)[^。；;\n]{0,15}?(?:在|为|位于|属于)?[^。；;\n]{0,6}?"
+        r"(本市|本地|当地|本区|本县|本省)",
+        # 「须在本市注册/工商登记」
+        r"(本市|本地|当地|本区|本县|本省)[^。；;\n]{0,8}?(?:注册|工商登记)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            w = m.group(1)
+            level = "province" if w == "本省" else ("district" if w in ("本区", "本县") else "city")
+            ev = _ev(text, m)
+            return level, ev, bool(_LOCAL_ALT.search(ev))
+    return None, None, False
+
+
+def _find_cert(text, cert_list):
+    """在正文里找这批证书里被要求的 → [(证书名, evidence)]"""
+    hits = []
+    for cert in cert_list or []:
+        key = cert.replace("证", "").replace("经营", "")[:8]
+        m = re.search(re.escape(cert), text) or (re.search(re.escape(key), text) if len(key) >= 5 else None)
+        if m:
+            hits.append((cert, _ev(text, m)))
+    return hits
+
+
+_SENT_RE = re.compile(r"[^。；;\n]+")
+_CERT_WORDS = re.compile(r"资质|许可证|证书|认证|备案")
+# 几乎每份公告都有的套话，不是真正的资质门槛
+_CERT_NOISE = re.compile(r"营业执照|第二十二条|独立承担|信用|CA|数字证书|身份证|授权|社会保险|社保|纳税|税收|财务"
+                         r"|违法|联合体|中小企业|残疾人|监狱|声明函|承诺函|签章|保证金|质疑|复印件|原件")
+# 真正的资质门槛 = 主语是投标方 + 「具有 / 持有」某个具体的证。
+# 实测噪音：「报价需含资质材料」（递交材料）、「供应商资质要求：」（空表单字段）、「算法通过网信办备案」（对产品的要求）
+_CERT_SUBJECT = re.compile(r"供应商|投标人|响应人|报价人|申请人|比选人|磋商人|应答人|竞标人|投标单位")
+_CERT_NAME = re.compile(r"(?:具有|具备|持有|取得)(?:有效的?|合法的?|国家)?"
+                        r"(《?[^，,。；;、：:（(]{2,30}?(?:许可证|资质证书|认证证书|资质|认证|证书|备案)》?)")
+_CERT_GENERIC = re.compile(r"^《?(?:相关|相应|有效|企业|投标|资格|上述|以下|所需|合法|必要|本项目|供应商|独立|法人)"
+                           r"|相适应|相应的|相关的")
+
+
+def _cert_required(s):
+    if not _CERT_SUBJECT.search(s):
+        return False
+    # 「不具备…资质的」是排除条款，不是资质要求
+    return any(not _CERT_GENERIC.search(m.group(1)) and s[max(0, m.start() - 1):m.start()] != "不"
+               for m in _CERT_NAME.finditer(s))
+
+
+_CASE_WORDS = re.compile(r"业绩|案例|类似项目|同类项目")
+_SCORE_WORDS = re.compile(r"得分|加分|分值|评分|计分|每提供|最高得|最多得|得[0-9一二三四五]")
+# 实测：「业绩资格审核条款：供应商需提供近 18 个月内…业绩」——门槛常写成「需提供 / 资格审核」
+_GATE_WORDS = re.compile(r"须|必须|应当?具[有备]|[需须应]提供|否则|无效|不予|资格要求|资格条件|资格审[核查]|业绩要求")
+
+
+def _clauses(text, word_re, keep, limit=3, span=70):
+    """按句切，挑出含关键词且符合 keep 条件的句子（截取关键词附近），去重后最多 limit 条"""
+    out = []
+    for m in _SENT_RE.finditer(text):
+        s = m.group(0)
+        k = word_re.search(s)
+        if not k or not keep(s):
+            continue
+        a = max(0, k.start() - span)
+        frag = re.sub(r"\s+", " ", s[a:k.end() + span]).strip()
+        if frag and all(frag not in x and x not in frag for x in out):
+            out.append(frag)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _local_check(level, basics, bid_prov, bid_city):
+    """本地注册比对 → (结论, 说明)"""
+    rp, rc = basics.get("reg_prov"), basics.get("reg_city")
+    where = " ".join(x for x in [bid_prov, bid_city] if x) or "未知"
+    if not bid_prov:
+        return "需确认", "公告要求本地注册，但标的所在地未知"
+    if level == "province" or bid_prov in _MUNICIPALITIES:
+        ok = rp == bid_prov
+        return ("满足" if ok else "不满足"), "公告要求本地注册，标的在 %s，你们注册在 %s" % (where, rp)
+    if rp != bid_prov:
+        return "不满足", "公告要求本地注册，标的在 %s，你们注册在 %s" % (where, rp)
+    if not bid_city or not rc:
+        return "需确认", "公告要求本地注册，标的在 %s，请确认是否同一城市" % where
+    if rc != bid_city:
+        return "不满足", "公告要求本地注册，标的在 %s，你们注册在 %s" % (where, rc)
+    if level == "district":
+        return "需确认", "公告要求在本区县注册，标的在 %s，请确认是否同一区县" % where
+    return "满足", "公告要求本地注册，标的在 %s，你们注册地相符" % where
+
+
+def screen_one(text, prof, prov_code=None, city_code=None):
+    """对单条标的正文做门槛比对。不调接口。"""
+    b = prof.get("basics") or {}
+    ask_on = prof.get("ask", True)
+    checks, asks = {}, []
+
+    def mark(name, state, detail=None, ev=None, ask=None):
+        checks[name] = {"结论": state}
+        if detail:
+            checks[name]["说明"] = detail
+        if ev:
+            checks[name]["原文"] = ev
+        if ask and ask_on:
+            asks.append(ask)
+
+    # 1) 注册资本
+    need, ev = _req_capital(text)
+    have = b.get("capital_wan")
+    if need is None:
+        mark("注册资本", "未提及")
+    elif have is None:
+        mark("注册资本", "待补充", "要求 %g 万" % need, ev,
+             {"field": "capital_wan", "question": "这条要求注册资本不低于 %g 万，你们公司注册资本是多少万？" % need})
+    elif have < need:
+        mark("注册资本", "不满足", "要求 %g 万，你们 %g 万" % (need, have), ev)
+    elif "实缴" in ev:
+        # 档案里是注册资本，实缴未知 → 不判满足
+        mark("注册资本", "需确认", "要求实缴 %g 万，你们注册资本 %g 万，请确认实缴金额" % (need, have), ev)
+    else:
+        mark("注册资本", "满足", "要求 %g 万，你们 %g 万" % (need, have), ev)
+
+    # 2) 成立年限 —— 成立时间可能只精确到年/月，用最早、最晚两个端点判定
+    need, ev = _req_years(text)
+    lo, hi = _est_bounds(b.get("established"))
+    if need is None:
+        mark("成立年限", "未提及")
+    elif lo is None:
+        mark("成立年限", "待补充", "要求成立满 %d 年" % need, ev,
+             {"field": "established", "question": "这条要求公司成立满 %d 年，你们是哪年成立的？" % need})
+    else:
+        today = now_cn().date()
+        min_yrs = (today - hi).days / 365.25
+        max_yrs = (today - lo).days / 365.25
+        if min_yrs >= need:
+            mark("成立年限", "满足", "要求 %d 年，你们约 %.1f 年" % (need, min_yrs), ev)
+        elif max_yrs < need:
+            mark("成立年限", "不满足", "要求 %d 年，你们约 %.1f 年" % (need, max_yrs), ev)
+        else:
+            mark("成立年限", "需确认", "要求满 %d 年，你们成立于 %s，差不多刚好卡线" % (need, b["established"]), ev,
+                 {"field": "established", "question": "这条要求成立满 %d 年，你们刚好卡线，能告诉我具体成立日期吗？" % need})
+
+    # 3) 参保人数
+    need, ev = _req_headcount(text)
+    have = b.get("headcount")
+    if need is None:
+        mark("参保人数", "未提及")
+    elif have is None:
+        mark("参保人数", "待补充", "要求 %d 人" % need, ev,
+             {"field": "headcount", "question": "这条要求参保人数不少于 %d 人，你们公司现在大概多少人交社保？" % need})
+    else:
+        mark("参保人数", "满足" if have >= need else "不满足", "要求 %d 人，你们 %d 人" % (need, have), ev)
+
+    # 4) 本地注册
+    level, ev, alt = _req_local(text)
+    bid_prov, bid_city = _PROV_BY_CODE.get(prov_code), _CITY_BY_CODE.get(city_code)
+    if not level:
+        mark("本地注册", "未提及")
+    elif alt:
+        where = " ".join(x for x in [bid_prov, bid_city] if x) or "当地"
+        st = "需确认"
+        if b.get("reg_prov"):
+            st, _ = _local_check(level, b, bid_prov, bid_city)
+            st = "满足" if st == "满足" else "需确认"
+        mark("本地注册", st, "公告要求在 %s 本地注册，或在当地设分支机构 / 服务网点" % where, ev)
+    elif not b.get("reg_prov"):
+        where = " ".join(x for x in [bid_prov, bid_city] if x) or "当地"
+        mark("本地注册", "待补充", "公告要求本地注册（标的在 %s）" % where, ev,
+             {"field": "reg_area", "question": "这条要求本地注册（标的在 %s），你们公司注册在哪个城市？" % where})
+    else:
+        st, detail = _local_check(level, b, bid_prov, bid_city)
+        mark("本地注册", st, detail, ev)
+
+    # 5) 供应商库 —— 库各不相同，没法记在档案里，一律请用户自己确认
+    ev = _req_prequalified(text)
+    if ev:
+        mark("供应商库", "需确认", "公告要求事先入库 / 入围的供应商才能投，请确认你们是否在该库中", ev)
+    else:
+        mark("供应商库", "未提及")
+
+    # 6) 资质证书 —— 档案里记过的（有 / 没有）由代码判；没记过的交给模型读原文后问用户
+    certs = prof.get("certs") or {}
+    known = _find_cert(text, list(certs))
+    lacking = [(c, e) for c, e in known if not certs[c]]
+    held = [c for c, _ in known if certs[c]]
+    if lacking:
+        mark("资质证书", "不满足", "本项目要求《%s》，你们没有" % "》《".join(c for c, _ in lacking), lacking[0][1])
+    elif held:
+        mark("资质证书", "满足", "本项目要求的《%s》你们有" % "》《".join(held))
+    else:
+        mark("资质证书", "未提及")
+    known_names = [c for c, _ in known]
+    cert_clauses = _clauses(
+        text, _CERT_WORDS,
+        lambda s: _cert_required(s) and not _CERT_NOISE.search(s) and not any(c in s for c in known_names))
+
+    # 7) 业绩 —— 先分「资格门槛」还是「评分加分项」；语义比对交给模型，永远不折叠
+    case_gate = _clauses(text, _CASE_WORDS, lambda s: not _SCORE_WORDS.search(s) and _GATE_WORDS.search(s))
+    case_score = _clauses(text, _CASE_WORDS, lambda s: bool(_SCORE_WORDS.search(s)), limit=2)
+
+    extra = []
+    if cert_clauses:
+        extra.append("公告另有资质证书要求，待确认")
+    if case_gate:
+        extra.append("公告设有业绩门槛，待确认")
+    fold = any(checks[k]["结论"] == "不满足" for k in checks)
+    return {
+        "fold": fold,
+        "match_line": render_match(checks, extra),
+        "checks": checks,
+        "cert_clauses": cert_clauses,
+        "case_gate_clauses": case_gate,
+        "case_score_clauses": case_score,
+        "known_certs": {k: _yn(v) for k, v in certs.items()},
+        "known_cases": {k: _yn(v) for k, v in (prof.get("cases") or {}).items()},
+        "ask_enabled": ask_on,
+        "asks": asks,
+    }
+
+
+def render_match(checks, extra=()):
+    """把 checks 渲染成可以直接抄进回复的成品句。只报异常，符合就一句话。"""
+    def say(k, c):
+        d = c.get("说明") or k
+        # 数字类门槛的说明里没有项目名（「要求 100 万」），补上，否则用户不知道指什么
+        return "%s%s" % (k, d) if k in ("注册资本", "成立年限", "参保人数") and not d.startswith(k) else d
+
+    bad = [say(k, c) for k, c in checks.items() if c["结论"] == "不满足"]
+    warn = [say(k, c) for k, c in checks.items() if c["结论"] in ("需确认", "待补充")]
+    warn += list(extra)
+    if bad:
+        return "❌ 门槛不符：" + "；".join(bad)
+    if warn:
+        return "需确认：" + "；".join(warn)
+    return "✅ 未发现与你们资质不符的门槛"
+
+
+PROFILE_HINT = "填写公司基本情况后，我可以帮你判断每条标的门槛够不够得上。随时发送「填写我的资质」就行。"
+
+MATCH_RULE = (
+    "match_line 是成品句，原样抄进回复，不得改写或自行翻译 checks——「未提及」意思是查过了公告没写，不是「没核对」。"
+    "cert_clauses / case_gate_clauses / case_score_clauses 是原文摘录，按 SKILL.md「资质匹配」处理；"
+    "asks 为空或 ask_enabled 为 false 时不追问。"
+)
+
+
+def _expired(deadline):
+    """报名截止已过 → True。没有截止日期的一律 False（不能当成已截止）。
+    带时分秒的按时刻比：「今天 10:00 截止」中午推送时已经过了，countdown_of 只按天算会显示「今天截止」"""
+    if not deadline:
+        return False
+    try:
+        return datetime.strptime(deadline.strip()[:19], "%Y-%m-%d %H:%M:%S") < now_cn()
+    except ValueError:
+        return (countdown_of(deadline) or "").startswith("⚠️已截止")
+
+
+def cmd_screen(args):
+    """批量查报名截止 + 门槛比对（推送 / 用户要求「按资质筛一下」时用）。
+    列表接口没有截止日期，只能逐条拉结构化详情；过期的在这里标出来，推送时不推。
+    有资质档案：每条 2 次请求（截止 + 正文比对，过期判断不额外花请求）；档案为空：每条 1 次（只查截止）。"""
+    key = get_key()
+    prof = load_profile()
+    empty = profile_empty(prof)
+    pairs = []
+    for item in (args.ids or "").split(";;"):
+        item = item.strip()
+        if not item:
+            continue
+        i, _, pt = item.partition("|")
+        try:
+            pairs.append((int(i.strip()), pt.strip()))
+        except ValueError:
+            die("--ids 格式错误：%s（应为 id|publish_time，多条用 ;; 分隔）" % item)
+    if not pairs:
+        die('没有要筛的标：--ids "id|publish_time;;id|publish_time"')
+    over = max(0, len(pairs) - SCREEN_MAX)
+    pairs = pairs[:SCREEN_MAX]
+
+    out, ask_count = [], {}
+    for idx, (bid, pt) in enumerate(pairs):
+        try:
+            st = post("getZTBStructreDetail", {"id": bid, "publishTime": pt}, key).get("data") or {}
+            ct = {} if empty else (post("getZTBProjectDetail", {"id": bid, "publishTime": pt}, key).get("data") or {})
+        except ApiError as e:
+            out.append({"id": bid, "publish_time": pt, "error": str(e), "expired": False, "fold": False,
+                        "match_line": None if empty else "未能比对（拉取失败），不折叠"})
+            continue
+        deadline = _flat(st.get("siginUpStopDate"))
+        row = {
+            "id": bid,
+            "publish_time": pt,
+            "title": strip_html(st.get("projectName") or ct.get("title") or ""),
+            "signup_deadline": deadline or "未注明",
+            "countdown": countdown_of(deadline) or "未注明",
+            "expired": _expired(deadline),
+        }
+        if empty:
+            row.update({"fold": False, "match_line": None})
+        else:
+            m = screen_one(strip_html(ct.get("content") or ""), prof, ct.get("proviceCode"), ct.get("cityCode"))
+            if not row["expired"]:   # 过期的标不再为它追问
+                for a in m["asks"]:
+                    ask_count.setdefault(a["field"], [0, a])[0] += 1
+            row.update(m)
+        out.append(row)
+        if idx < len(pairs) - 1:
+            time.sleep(1.1)          # 限速 60 次/分钟
+
+    # 同一个缺项在多条标里出现，只问一次；按出现次数挑最多 2 个
+    ask_next = [dict(v[1], hits=v[0]) for v in sorted(ask_count.values(), key=lambda v: -v[0])][:2]
+    print(json.dumps({
+        "ok": True, "engine": "bidwin-radar v%s" % VERSION,
+        "push_mode": prof.get("push_mode", "fold"),
+        "profile_empty": empty,
+        "summary": {"送检": len(pairs), "已截止": sum(1 for r in out if r.get("expired")),
+                    "门槛不符": sum(1 for r in out if r.get("fold") and not r.get("expired")),
+                    "拉取失败": sum(1 for r in out if r.get("error")),
+                    "超出上限未筛": over},
+        "ask_next": ask_next if prof.get("ask", True) and not empty else [],
+        "api_calls": _CALLS["n"],
+        "rule": ("expired 为 true 的已过报名截止：推送时直接不推；列表精筛时折叠成一行。"
+                 + ("资质档案为空，只查了截止日期，不做资质比对、不追问。" if empty else MATCH_RULE)
+                 + " 结果顺序与传入顺序一致，不重排。"),
+        "results": out,
+    }, ensure_ascii=False, indent=2))
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -950,6 +1563,30 @@ def build_parser():
     wr.add_argument("--dry-run", action="store_true", help="试跑：不记录为已推送")
     wr.add_argument("--replay", help=argparse.SUPPRESS)
     wr.set_defaults(func=cmd_watch_run)
+
+    sc = sub.add_parser("screen", help="批量拉正文做资质门槛比对（每条 2 次请求）")
+    sc.add_argument("--ids", required=True, help='"id|publish_time;;id|publish_time"，一次最多 %d 条' % SCREEN_MAX)
+    sc.set_defaults(func=cmd_screen)
+
+    pf = sub.add_parser("profile", help="资质档案（只存本机，不调接口）")
+    pfsub = pf.add_subparsers(dest="profile_cmd", required=True)
+    pfs = pfsub.add_parser("set", help="写入 / 修改基本门槛与偏好")
+    pfs.add_argument("--established", help="成立时间 YYYY / YYYY-MM / YYYY-MM-DD")
+    pfs.add_argument("--capital-wan", type=float, help="注册资本（万元）")
+    pfs.add_argument("--headcount", type=int, help="参保人数")
+    pfs.add_argument("--reg-area", help="注册地，省或地级市，如「上海」「杭州」")
+    pfs.add_argument("--ask", choices=["on", "off"], help="遇到缺项时是否追问")
+    pfs.add_argument("--push-mode", choices=list(PUSH_MODES), help="fold=不符合的折叠（默认）/ all=全部展示")
+    pfs.set_defaults(func=cmd_profile_set)
+    for name, fn, hint in (("cert", cmd_profile_cert, "资质证书名，如「广播电视节目制作经营许可证」"),
+                           ("case", cmd_profile_case, "业绩类型，如「汽车品牌TVC」")):
+        x = pfsub.add_parser(name, help="记录一项%s有 / 没有" % ("资质证书" if name == "cert" else "业绩"))
+        x.add_argument("--name", required=True, help=hint)
+        x.add_argument("--has", choices=["yes", "no"])
+        x.add_argument("--remove", action="store_true", help="从档案里删掉这一项")
+        x.set_defaults(func=fn)
+    pfv = pfsub.add_parser("show", help="查看资质档案")
+    pfv.set_defaults(func=cmd_profile_show)
 
     c = sub.add_parser("check", help="环境自检（不调接口）")
     c.set_defaults(func=cmd_check)
