@@ -24,10 +24,12 @@
     python3 radar.py screen --ids "304974237|2026-08-01 09:00:00;;304974238|2026-08-01 10:00:00"
 （Windows 上把 python3 换成 python 或 py）
 
-服务器每分钟最多接受 60 次请求；探量（--probe）也是一次请求，不要为试参数反复调用。
+服务器每分钟最多接受 60 次请求。--probe 已并入正式搜索（返回里本来就有 total），不要为试参数反复调用。
+本机缓存在 ~/.bidwin/cache：正文永久、结构化 2 天、同样的检索条件 30 分钟内复用，都不重复请求。
 """
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -253,7 +255,7 @@ class ApiError(RuntimeError):
     pass
 
 
-_CALLS = {"n": 0}
+_CALLS = {"n": 0, "cached": 0}
 
 
 def die(msg, code=2):
@@ -326,6 +328,169 @@ def post(path, payload, key):
         raise ApiError("接口返回 code=%s subCode=%s msg=%s"
                        % (data.get("code"), data.get("subCode"), data.get("msg") or data.get("subMsg")))
     return data
+
+
+# ── 本地缓存（只存在本机 ~/.bidwin/cache，不上传）──────────────────────────
+# 实测一位试用客户一个月里同一条标被反复拉了 613 次。正文不会变，拉过一次就存下来；
+# 结构化数据（报名截止等）可能被更正公告改掉，只存几天。缓存读写失败不影响查询。
+CACHE_DIR = "~/.bidwin/cache"
+STRUCT_TTL_DAYS = 2      # 结构化详情缓存几天
+SEARCH_TTL_MIN = 30      # 同样的检索条件多久内直接复用上次结果（「直接看」「更多」不再请求）
+
+
+def _cache_file(kind, name):
+    return os.path.join(os.path.expanduser(CACHE_DIR), kind, "%s.json" % name)
+
+
+def cache_get(kind, name, max_age=None):
+    p = _cache_file(kind, name)
+    try:
+        if max_age is not None and time.time() - os.path.getmtime(p) > max_age:
+            return None
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cache_put(kind, name, data):
+    p = _cache_file(kind, name)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _sig(obj):
+    return hashlib.sha1(json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+
+
+# ── 搜索用量（只存在本机 ~/.bidwin/usage.json）─────────────────────────────
+# 实测 Agent 会把一个需求拆成 40 多次单词搜索、每天把近一个月重搜一遍。
+# 本地计数是软限制（换电脑 / 删文件就没了），只防 Agent 自己越界；硬限额由网关管。
+USAGE_FILE = "~/.bidwin/usage.json"
+SEARCH_GUARD_N = 8       # 每 SEARCH_GUARD_MIN 分钟内最多真实搜索几次（复用缓存的不算）
+SEARCH_GUARD_MIN = 10
+USAGE_KEEP_DAYS = 14
+REPEAT_MIN_DAYS = 7      # 检索范围 ≥ 这么多天才算「全量搜」
+
+
+def load_usage():
+    try:
+        with open(os.path.expanduser(USAGE_FILE), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("searches", [])
+    return d
+
+
+def save_usage(d):
+    p = os.path.expanduser(USAGE_FILE)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _cond_sig(payload):
+    """检索条件指纹：去掉日期和翻页，只看「查什么」"""
+    return _sig({k: v for k, v in payload.items()
+                 if k not in ("startDate", "endDate", "pageId", "pageNumber")})
+
+
+def _window_days(payload):
+    s = datetime.strptime(payload["startDate"][:10], "%Y-%m-%d").date()
+    e = datetime.strptime(payload["endDate"][:10], "%Y-%m-%d").date()
+    return (e - s).days + 1
+
+
+def guard_search():
+    recent = [x for x in load_usage()["searches"] if x["at"] > time.time() - SEARCH_GUARD_MIN * 60]
+    if len(recent) >= SEARCH_GUARD_N:
+        die("%d 分钟内已经搜了 %d 次。请把同义词用 | 合并成一次搜索，或者先和用户确认要查的范围；"
+            "不要换个写法继续拆开搜。用户确认要继续查的，%d 分钟后再试"
+            % (SEARCH_GUARD_MIN, len(recent), SEARCH_GUARD_MIN), code=6)
+
+
+def record_search(payload):
+    d = load_usage()
+    keep = time.time() - USAGE_KEEP_DAYS * 86400
+    d["searches"] = [x for x in d["searches"] if x["at"] > keep]
+    d["searches"].append({"at": int(time.time()), "day": now_cn().strftime("%Y-%m-%d"),
+                          "cond": _cond_sig(payload), "days": _window_days(payload)})
+    save_usage(d)
+
+
+def repeat_hint(payload):
+    """同一组条件前几天已经全量搜过 → 提示改用定时推送（近 3 天 + 推过的跳过）"""
+    if _window_days(payload) < REPEAT_MIN_DAYS:
+        return None
+    today = now_cn().strftime("%Y-%m-%d")
+    since = (now_cn() - timedelta(days=REPEAT_MIN_DAYS)).strftime("%Y-%m-%d")
+    cond = _cond_sig(payload)
+    days = sorted({x["day"] for x in load_usage()["searches"]
+                   if x["cond"] == cond and x["days"] >= REPEAT_MIN_DAYS and since <= x["day"] < today})
+    if not days:
+        return None
+    return ("这组条件 %s 已经按近 %d 天以上搜过。用户如果是每天来看新标，"
+            "建议改用每日推送（只查近 3 天、推过的自动跳过），比每天重搜一遍省得多"
+            % ("、".join(days), REPEAT_MIN_DAYS))
+
+
+def coverage_of(raw_rows, start, end, has_next):
+    """这一页覆盖了检索范围里的几天。接口只按发布时间倒序，第一页就是最新的那一批：
+    total 很大时第一页只能看到最近几天甚至几小时，比 total 更能说明用户实际看得到多少。"""
+    s = datetime.strptime(start[:10], "%Y-%m-%d").date()
+    e = datetime.strptime(end[:10], "%Y-%m-%d").date()
+    window = (e - s).days + 1
+    times = sorted((r.get("publishTime") or "")[:10] for r in raw_rows if r.get("publishTime"))
+    if not has_next or not times:
+        return {"window_days": window, "covered_days": window, "complete": True,
+                "earliest": times[0] if times else None,
+                "text": "检索范围内的结果已全部在这一页"}
+    earliest = datetime.strptime(times[0], "%Y-%m-%d").date()
+    covered = max(1, min(window, (e - earliest).days + 1))
+    if covered == 1:
+        text = "这一页 %d 条全是 %s 当天发布的，%d 天的检索范围只看到了最后 1 天" % (
+            len(raw_rows), e.strftime("%m-%d"), window)
+    else:
+        text = "这一页 %d 条最早到 %s，%d 天的检索范围只覆盖了最近 %d 天" % (
+            len(raw_rows), earliest.strftime("%m-%d"), window, covered)
+    return {"window_days": window, "covered_days": covered, "complete": False,
+            "earliest": times[0], "text": text}
+
+
+def get_struct(bid, pt, key):
+    """结构化详情：报名截止 / 预算 / 联系人 / 开标。缓存 STRUCT_TTL_DAYS 天"""
+    d = cache_get("struct", bid, STRUCT_TTL_DAYS * 86400)
+    if d is not None:
+        _CALLS["cached"] += 1
+        return d
+    d = post("getZTBStructreDetail", {"id": bid, "publishTime": pt}, key).get("data") or {}
+    if d:
+        cache_put("struct", bid, d)
+    return d
+
+
+def get_content(bid, pt, key):
+    """正文详情：地区 / 行业 / 阶段 / 全文 / 附件。正文不会变，永久缓存"""
+    d = cache_get("content", bid)
+    if d is not None:
+        _CALLS["cached"] += 1
+        return d
+    d = post("getZTBProjectDetail", {"id": bid, "publishTime": pt}, key).get("data") or {}
+    if d:
+        cache_put("content", bid, d)
+    return d
 
 
 # ── 搜索 ────────────────────────────────────────────────────────────────
@@ -416,7 +581,7 @@ def match_pos(title, keyword):
 
 
 def run_search(args):
-    """执行一次检索，返回 (meta, rows)；探量时 rows 为 None。"""
+    """执行一次检索，返回 (meta, rows)。同样的条件 SEARCH_TTL_MIN 分钟内复用上次结果。"""
     key = None if args.replay else get_key()   # 回放模式不需要 key
     start, end, how = resolve_window(args)
 
@@ -464,7 +629,8 @@ def run_search(args):
     if purchase is None:
         die("--purchase 只能是：%s" % " / ".join(PURCHASE_TYPES))
 
-    size = 0 if args.probe else min(args.size, PAGE_MAX)
+    # 探量已并入正式搜索：正式搜的返回里本来就有 total，单独探量等于多花一次请求
+    size = min(args.size, PAGE_MAX)
     payload = {
         "startDate": start,
         "endDate": end,
@@ -494,10 +660,20 @@ def run_search(args):
         except OSError as e:
             die("读不到回放文件 %s：%s" % (args.replay, e))
     else:
-        try:
-            resp = post("searchProjectApi", payload, key)
-        except ApiError as e:
-            die(str(e), code=3)
+        sig = _sig(payload)
+        resp = cache_get("search", sig, SEARCH_TTL_MIN * 60)
+        if resp is not None:
+            _CALLS["cached"] += 1
+        else:
+            if getattr(args, "guard", False):
+                guard_search()
+            try:
+                resp = post("searchProjectApi", payload, key)
+            except ApiError as e:
+                die(str(e), code=3)
+            cache_put("search", sig, resp)
+            if getattr(args, "guard", False):
+                record_search(payload)
         if args.dump_raw:
             with open(args.dump_raw, "w", encoding="utf-8") as f:
                 json.dump(resp, f, ensure_ascii=False, indent=2)
@@ -522,12 +698,17 @@ def run_search(args):
         "page_size": d.get("pageNumber"),
         "has_next": d.get("hasNext"),
         "probe": bool(args.probe),
+        "coverage": coverage_of(d.get("data") or [], start, end, d.get("hasNext")),
+        "api_calls": _CALLS["n"],
+        "from_cache": _CALLS["cached"] > 0,
     }
-
     if args.probe:
-        meta["hint"] = ("total ≤ 100 可直接正式搜；> 100 建议先帮用户缩窄"
-                        "（限地区 / 缩时间 / 加排除词），不要直接甩一堆结果")
-        return meta, None
+        meta["probe_note"] = ("探量已并入正式搜索，结果一并返回；"
+                              "随后用同样条件正式搜会直接复用这次结果，不再请求")
+    if getattr(args, "guard", False) and not args.replay:
+        hint = repeat_hint(payload)
+        if hint:
+            meta["repeat_hint"] = hint
 
     rows = [shape(r) for r in (d.get("data") or [])]
     raw_n = len(rows)
@@ -569,6 +750,7 @@ def run_search(args):
 
 
 def cmd_search(args):
+    args.guard = True        # 用户 / Agent 直接发起的搜索才计数；推送内部的不计
     meta, rows = run_search(args)
     emit(meta, args, rows)
 
@@ -638,11 +820,9 @@ def cmd_detail(args):
     key = get_key()
     out = {"ok": True, "engine": "bidwin-radar v%s" % VERSION, "id": args.id}
     try:
-        st = post("getZTBStructreDetail",
-                  {"id": args.id, "publishTime": args.publish_time}, key).get("data") or {}
         # 一条标要取两份才够字段：结构化(截止/预算/联系人) + 正文(地区/行业/阶段/全文)
-        ct = {} if args.brief else (post("getZTBProjectDetail",
-              {"id": args.id, "publishTime": args.publish_time}, key).get("data") or {})
+        st = get_struct(args.id, args.publish_time, key)
+        ct = {} if args.brief else get_content(args.id, args.publish_time, key)
     except ApiError as e:
         die(str(e), code=3)
 
@@ -686,6 +866,8 @@ def cmd_detail(args):
             m["rule"] = MATCH_RULE
             out["match"] = m
     out["reminder"] = "字段为空一律输出「未注明」，不得编造，尤其不得用发布时间当报名截止日期"
+    out["api_calls"] = _CALLS["n"]
+    out["from_cache"] = _CALLS["cached"]
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
@@ -877,9 +1059,14 @@ def cmd_watch_run(args):
                 continue
             shown.add(k)
             new.append(r)
+        cov = meta["coverage"]
         out.append({
             "name": w["name"], "conditions": _watch_view(w)["conditions"], "total": meta["total"],
             "has_more_than_one_page": bool(meta.get("has_next")),
+            "coverage": cov,
+            "coverage_warning": None if cov["complete"] else (
+                "这组条件近 %d 天的新标超过一页，%s，会漏掉一部分；建议在推送结果后提醒用户收窄条件"
+                % (args.days, cov["text"])),
             "already_pushed_skipped": len(rows) - len(new), "new_count": len(new), "results": new,
         })
     if not args.dry_run:
@@ -898,6 +1085,7 @@ def cmd_watch_run(args):
     print(json.dumps({"ok": True, "engine": "bidwin-radar v%s" % VERSION, "date_range": date_range,
                       "date_basis": "近 %d 天（含今天），已推送过的标不再重复" % args.days,
                       "dry_run": bool(args.dry_run),
+                      "api_calls": _CALLS["n"],
                       "new_total": sum(x["new_count"] for x in out),
                       "screen": {
                           # 列表没有截止日期：不管有没有资质档案，都要走 screen 去掉已过报名截止的标
@@ -1422,7 +1610,8 @@ def _expired(deadline):
 def cmd_screen(args):
     """批量查报名截止 + 门槛比对（推送 / 用户要求「按资质筛一下」时用）。
     列表接口没有截止日期，只能逐条拉结构化详情；过期的在这里标出来，推送时不推。
-    有资质档案：每条 2 次请求（截止 + 正文比对，过期判断不额外花请求）；档案为空：每条 1 次（只查截止）。"""
+    先查截止：已过期的不再拉正文。有资质档案：未过期的每条 2 次请求（截止 + 正文比对）；
+    档案为空：每条 1 次（只查截止）。拉过的都进缓存，再筛或看详情不重复请求。"""
     key = get_key()
     prof = load_profile()
     empty = profile_empty(prof)
@@ -1443,33 +1632,37 @@ def cmd_screen(args):
 
     out, ask_count = [], {}
     for idx, (bid, pt) in enumerate(pairs):
+        before = _CALLS["n"]
         try:
-            st = post("getZTBStructreDetail", {"id": bid, "publishTime": pt}, key).get("data") or {}
-            ct = {} if empty else (post("getZTBProjectDetail", {"id": bid, "publishTime": pt}, key).get("data") or {})
+            st = get_struct(bid, pt, key)
+            deadline = _flat(st.get("siginUpStopDate"))
+            expired = _expired(deadline)
+            ct = {} if (empty or expired) else get_content(bid, pt, key)
         except ApiError as e:
             out.append({"id": bid, "publish_time": pt, "error": str(e), "expired": False, "fold": False,
                         "match_line": None if empty else "未能比对（拉取失败），不折叠"})
             continue
-        deadline = _flat(st.get("siginUpStopDate"))
         row = {
             "id": bid,
             "publish_time": pt,
             "title": strip_html(st.get("projectName") or ct.get("title") or ""),
             "signup_deadline": deadline or "未注明",
             "countdown": countdown_of(deadline) or "未注明",
-            "expired": _expired(deadline),
+            "expired": expired,
         }
         if empty:
             row.update({"fold": False, "match_line": None})
+        elif expired:
+            # 已过报名截止的不拉正文、不比对，推送时直接不推
+            row.update({"fold": False, "match_line": "已过报名截止，未做资质比对"})
         else:
             m = screen_one(strip_html(ct.get("content") or ""), prof, ct.get("proviceCode"), ct.get("cityCode"))
-            if not row["expired"]:   # 过期的标不再为它追问
-                for a in m["asks"]:
-                    ask_count.setdefault(a["field"], [0, a])[0] += 1
+            for a in m["asks"]:
+                ask_count.setdefault(a["field"], [0, a])[0] += 1
             row.update(m)
         out.append(row)
-        if idx < len(pairs) - 1:
-            time.sleep(1.1)          # 限速 60 次/分钟
+        if _CALLS["n"] > before and idx < len(pairs) - 1:
+            time.sleep(1.1)          # 限速 60 次/分钟；全从缓存取的不用等
 
     # 同一个缺项在多条标里出现，只问一次；按出现次数挑最多 2 个
     ask_next = [dict(v[1], hits=v[0]) for v in sorted(ask_count.values(), key=lambda v: -v[0])][:2]
@@ -1483,6 +1676,7 @@ def cmd_screen(args):
                     "超出上限未筛": over},
         "ask_next": ask_next if prof.get("ask", True) and not empty else [],
         "api_calls": _CALLS["n"],
+        "from_cache": _CALLS["cached"],
         "rule": ("expired 为 true 的已过报名截止：推送时直接不推；列表精筛时折叠成一行。"
                  + ("资质档案为空，只查了截止日期，不做资质比对、不追问。" if empty else MATCH_RULE)
                  + " 结果顺序与传入顺序一致，不重排。"),
@@ -1517,7 +1711,7 @@ def build_parser():
     s.add_argument("--money-max", type=int, help="项目金额上限（元）")
     s.add_argument("--page", type=int, default=1, help="页码，默认 1")
     s.add_argument("--size", type=int, default=PAGE_MAX, help="每页条数，硬顶 50")
-    s.add_argument("--probe", action="store_true", help="只探量取 total，不返回数据")
+    s.add_argument("--probe", action="store_true", help="兼容旧用法：已并入正式搜索，照常返回结果和 total")
     s.add_argument("--allow-result", action="store_true", help="保留中标/合同等结果类（默认剔除）")
     s.add_argument("--limit", type=int, help="最多输出几条")
     s.add_argument("--out", help="写入 JSON 文件而不是打印全文")
@@ -1564,7 +1758,7 @@ def build_parser():
     wr.add_argument("--replay", help=argparse.SUPPRESS)
     wr.set_defaults(func=cmd_watch_run)
 
-    sc = sub.add_parser("screen", help="批量拉正文做资质门槛比对（每条 2 次请求）")
+    sc = sub.add_parser("screen", help="批量查报名截止 + 资质门槛比对（已过期的不拉正文，拉过的走缓存）")
     sc.add_argument("--ids", required=True, help='"id|publish_time;;id|publish_time"，一次最多 %d 条' % SCREEN_MAX)
     sc.set_defaults(func=cmd_screen)
 
