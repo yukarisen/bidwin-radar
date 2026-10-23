@@ -17,7 +17,7 @@
     python3 radar.py setkey --key <key>                      # 写入 key（不调接口）
     python3 radar.py search --keyword "数字人|虚拟人" --area 北京 --last 1m --probe
     python3 radar.py search --keyword "数字人" --last 1m --limit 20
-    python3 radar.py detail --id 304974237 --publish-time "2026-08-01 09:00:00"
+    python3 radar.py detail --id 304974237                    # 发布时间脚本按 id 自己补
     python3 radar.py areas 杭州                               # 查地名（不调接口）
     python3 radar.py profile set --established 2019-06 --capital-wan 500 --headcount 30 --reg-area 杭州
     python3 radar.py profile cert --name "广播电视节目制作经营许可证" --has no
@@ -469,6 +469,44 @@ def coverage_of(raw_rows, start, end, has_next):
             "earliest": times[0], "text": text}
 
 
+# ── 搜过的标：id → 发布时间（只存在本机 ~/.bidwin/cache/ids.json）────────────
+# 看详情、screen 只传 id 就行，发布时间由这里补；id 不在里面说明多半抄错了，直接报错不发请求。
+# 实测 Agent 手抄 19 组「id|发布时间」时抄错一个，恰好是另一条真实的标，脚本照常筛了，白花请求。
+IDS_KEEP_DAYS = 7        # 用户隔天再说「按资质筛一下昨天那批」也要认得
+
+
+def remember_ids(raw_rows):
+    """记下搜索 / 推送拉到的每条标。用接口原始的 publishTime（去重时会把重复条的时间合过来，不用那个）"""
+    if not raw_rows:
+        return
+    d = cache_get("index", "ids") or {}
+    now = int(time.time())
+    keep = now - IDS_KEEP_DAYS * 86400
+    d = {k: v for k, v in d.items() if v.get("at", 0) > keep}
+    for r in raw_rows:
+        if r.get("id") and r.get("publishTime"):
+            d[str(r["id"])] = {"pt": r["publishTime"], "at": now}
+    cache_put("index", "ids", d)
+
+
+def resolve_ids(items):
+    """[(id, 发布时间或空)] → [(id, 发布时间)]。发布时间空的从记录里补；
+    不在最近 IDS_KEEP_DAYS 天搜索 / 推送结果里的 id 一律报错，一次请求都不发。"""
+    known = cache_get("index", "ids") or {}
+    keep = time.time() - IDS_KEEP_DAYS * 86400
+    out, unknown = [], []
+    for bid, pt in items:
+        rec = known.get(str(bid))
+        if not rec or rec.get("at", 0) <= keep:
+            unknown.append(str(bid))
+            continue
+        out.append((bid, pt or rec["pt"]))
+    if unknown:
+        die("这些 id 不在最近 %d 天的搜索 / 推送结果里：%s。多半是抄错了，请对照搜索结果核对后重试；"
+            "如果是更早查到的标，先用原来的条件再搜一次" % (IDS_KEEP_DAYS, "、".join(unknown)), code=7)
+    return out
+
+
 def get_struct(bid, pt, key):
     """结构化详情：报名截止 / 预算 / 联系人 / 开标。缓存 STRUCT_TTL_DAYS 天"""
     d = cache_get("struct", bid, STRUCT_TTL_DAYS * 86400)
@@ -709,6 +747,8 @@ def run_search(args):
         hint = repeat_hint(payload)
         if hint:
             meta["repeat_hint"] = hint
+    if not args.replay:
+        remember_ids(d.get("data") or [])
 
     rows = [shape(r) for r in (d.get("data") or [])]
     raw_n = len(rows)
@@ -819,10 +859,11 @@ def _party(info):
 def cmd_detail(args):
     key = get_key()
     out = {"ok": True, "engine": "bidwin-radar v%s" % VERSION, "id": args.id}
+    (_, pt), = resolve_ids([(args.id, args.publish_time or "")])
     try:
         # 一条标要取两份才够字段：结构化(截止/预算/联系人) + 正文(地区/行业/阶段/全文)
-        st = get_struct(args.id, args.publish_time, key)
-        ct = {} if args.brief else get_content(args.id, args.publish_time, key)
+        st = get_struct(args.id, pt, key)
+        ct = {} if args.brief else get_content(args.id, pt, key)
     except ApiError as e:
         die(str(e), code=3)
 
@@ -1615,20 +1656,20 @@ def cmd_screen(args):
     key = get_key()
     prof = load_profile()
     empty = profile_empty(prof)
-    pairs = []
-    for item in (args.ids or "").split(";;"):
+    items = []
+    for item in re.split(r";;|,", args.ids or ""):
         item = item.strip()
         if not item:
             continue
-        i, _, pt = item.partition("|")
+        i, _, pt = item.partition("|")     # 兼容旧写法 id|publish_time
         try:
-            pairs.append((int(i.strip()), pt.strip()))
+            items.append((int(i.strip()), pt.strip()))
         except ValueError:
-            die("--ids 格式错误：%s（应为 id|publish_time，多条用 ;; 分隔）" % item)
-    if not pairs:
-        die('没有要筛的标：--ids "id|publish_time;;id|publish_time"')
-    over = max(0, len(pairs) - SCREEN_MAX)
-    pairs = pairs[:SCREEN_MAX]
+            die("--ids 格式错误：%s（应为 id，多条用逗号分隔）" % item)
+    if not items:
+        die('没有要筛的标：--ids "id,id,id"')
+    over = max(0, len(items) - SCREEN_MAX)
+    pairs = resolve_ids(items[:SCREEN_MAX])
 
     out, ask_count = [], {}
     for idx, (bid, pt) in enumerate(pairs):
@@ -1721,7 +1762,7 @@ def build_parser():
 
     d = sub.add_parser("detail", help="拉单条标详情")
     d.add_argument("--id", required=True, type=int)
-    d.add_argument("--publish-time", required=True, help="列表里的 publish_time 原值")
+    d.add_argument("--publish-time", help="可省略：脚本按 id 从最近的搜索结果里补")
     d.add_argument("--with-content", action="store_true", help="附带正文")
     d.add_argument("--max-chars", type=int, default=3000, help="正文最多输出多少字，默认 3000")
     d.add_argument("--brief", action="store_true", help="只取结构化字段，少一次请求（拿不到地区/行业/阶段）")
@@ -1759,7 +1800,7 @@ def build_parser():
     wr.set_defaults(func=cmd_watch_run)
 
     sc = sub.add_parser("screen", help="批量查报名截止 + 资质门槛比对（已过期的不拉正文，拉过的走缓存）")
-    sc.add_argument("--ids", required=True, help='"id|publish_time;;id|publish_time"，一次最多 %d 条' % SCREEN_MAX)
+    sc.add_argument("--ids", required=True, help='"id,id,id"（发布时间脚本自己补），一次最多 %d 条' % SCREEN_MAX)
     sc.set_defaults(func=cmd_screen)
 
     pf = sub.add_parser("profile", help="资质档案（只存本机，不调接口）")
