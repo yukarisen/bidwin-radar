@@ -21,7 +21,7 @@
     python3 radar.py areas 杭州                               # 查地名（不调接口）
     python3 radar.py profile set --established 2019-06 --capital-wan 500 --headcount 30 --reg-area 杭州
     python3 radar.py profile cert --name "广播电视节目制作经营许可证" --has no
-    python3 radar.py screen --ids "304974237|2026-08-01 09:00:00;;304974238|2026-08-01 10:00:00"
+    python3 radar.py screen --ids "304974237,304974238"         # 只传 id，发布时间脚本自己补
 （Windows 上把 python3 换成 python 或 py）
 
 服务器每分钟最多接受 60 次请求。--probe 已并入正式搜索（返回里本来就有 total），不要为试参数反复调用。
